@@ -7,8 +7,115 @@ use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::lua::tid::generate_tid;
 use crate::spaces::types::*;
-use crate::spaces::{SpaceUri, db, members};
+use crate::spaces::{SpaceUri, db, members, oplog};
 use sha2::{Digest, Sha256};
+
+/// A record write that has already landed, waiting to be recorded in the repo's
+/// op log. Built by the write paths and handed to [`commit_ops`].
+pub(crate) struct PendingOp {
+    pub action: OplogAction,
+    pub collection: String,
+    pub rkey: String,
+    /// The cid this write produced; `None` for a delete.
+    pub cid: Option<String>,
+    /// The cid the record held beforehand, if it existed.
+    pub prev: Option<String>,
+}
+
+impl PendingOp {
+    pub fn create(collection: &str, rkey: &str, cid: &str) -> Self {
+        Self {
+            action: OplogAction::Create,
+            collection: collection.to_string(),
+            rkey: rkey.to_string(),
+            cid: Some(cid.to_string()),
+            prev: None,
+        }
+    }
+
+    pub fn delete(collection: &str, rkey: &str, prev: Option<String>) -> Self {
+        Self {
+            action: OplogAction::Delete,
+            collection: collection.to_string(),
+            rkey: rkey.to_string(),
+            cid: None,
+            prev,
+        }
+    }
+
+    /// A put is a create or an update depending on whether the record already
+    /// existed — clients replay puts blindly, so the log has to work out which
+    /// one actually happened.
+    pub fn put(collection: &str, rkey: &str, cid: &str, prev: Option<String>) -> Self {
+        match prev {
+            Some(prev) => Self {
+                action: OplogAction::Update,
+                collection: collection.to_string(),
+                rkey: rkey.to_string(),
+                cid: Some(cid.to_string()),
+                prev: Some(prev),
+            },
+            None => Self::create(collection, rkey, cid),
+        }
+    }
+}
+
+/// Record a batch of writes against one repo under a single revision, and
+/// publish it.
+///
+/// Every write path funnels through here so a repo's revision sequence has
+/// exactly one source. The order is deliberate:
+///
+/// 1. reserve a revision (a compare-and-set, so concurrent writers never share
+///    one — see `db::allocate_repo_rev`),
+/// 2. append the ops,
+/// 3. publish the space revision.
+///
+/// These are separate statements — nothing in this module runs inside a
+/// transaction — so a crash can interrupt the sequence. Appending before
+/// publishing is what makes that survivable: a repo's head is read from the log
+/// itself (`oplog::head`), so an interrupted write leaves a revision that was
+/// reserved and never used, which no reader ever sees. The reverse order would
+/// publish a head no op backs, and every client that stored it would skip the
+/// ops that later arrived under a lower revision.
+pub(crate) async fn commit_ops(
+    state: &AppState,
+    space: &Space,
+    author_did: &str,
+    ops: &[PendingOp],
+) -> Result<String, AppError> {
+    let rev = db::allocate_repo_rev(&state.db, state.db_backend, &space.id, author_did).await?;
+    let created_at = now_rfc3339();
+    for (idx, op) in ops.iter().enumerate() {
+        let entry = OplogEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            space_id: space.id.clone(),
+            author_did: author_did.to_string(),
+            rev: rev.clone(),
+            // Ops from one request share a revision and are ordered by `idx`, so
+            // a client paging through them can resume mid-batch.
+            idx: idx as i32,
+            action: op.action,
+            collection: op.collection.clone(),
+            rkey: op.rkey.clone(),
+            cid: op.cid.clone(),
+            prev: op.prev.clone(),
+            value: None,
+            created_at: created_at.clone(),
+        };
+        oplog::append_op(&state.db, state.db_backend, &entry).await?;
+    }
+    db::update_space_revision(&state.db, state.db_backend, &space.id, &rev).await?;
+    Ok(rev)
+}
+
+/// The cid a record currently holds, or `None` when it doesn't exist. Read
+/// before an overwrite so the op log can carry a `prev` link.
+pub(crate) async fn current_cid(state: &AppState, uri: &str) -> Result<Option<String>, AppError> {
+    Ok(db::get_space_record(&state.db, state.db_backend, uri)
+        .await?
+        .map(|r| r.cid))
+}
 
 pub(crate) async fn resolve_space(state: &AppState, space_ref: &str) -> Result<Space, AppError> {
     let uri = SpaceUri::parse(space_ref)?;
@@ -146,8 +253,13 @@ pub(crate) async fn create_record(
         indexed_at: now_rfc3339(),
     };
     db::insert_space_record(&state.db, state.db_backend, &rec).await?;
-    let rev = generate_tid();
-    db::update_space_revision(&state.db, state.db_backend, &space.id, &rev).await?;
+    commit_ops(
+        state,
+        &space,
+        did,
+        &[PendingOp::create(collection, &rec.rkey, &cid)],
+    )
+    .await?;
     Ok((record_uri, cid))
 }
 
@@ -181,13 +293,24 @@ pub(crate) async fn put_record(
         cid: cid.clone(),
         indexed_at: now_rfc3339(),
     };
+    // Read the outgoing version before overwriting it: `prev` is what lets a
+    // consumer of the log chain versions together. A swap already names it.
+    let prev = match &swap_cid {
+        Some(swap) => Some(swap.clone()),
+        None => current_cid(state, &record_uri).await?,
+    };
     if let Some(swap) = swap_cid {
         db::upsert_space_record_with_swap(&state.db, state.db_backend, &rec, &swap).await?;
     } else {
         db::upsert_space_record(&state.db, state.db_backend, &rec).await?;
     }
-    let rev = generate_tid();
-    db::update_space_revision(&state.db, state.db_backend, &space.id, &rev).await?;
+    commit_ops(
+        state,
+        &space,
+        did,
+        &[PendingOp::put(collection, rkey, &cid, prev)],
+    )
+    .await?;
     Ok((record_uri, cid))
 }
 
@@ -206,7 +329,11 @@ pub(crate) async fn delete_record(
         "at://{}/space/{}/{}/{}/{}/{}",
         space.did, space.type_nsid, space.skey, did, collection, rkey
     );
+    // The version being removed, for the log's `prev` link. A swap names it;
+    // otherwise the ownership check below has already fetched the record.
+    let prev;
     if let Some(swap) = swap_cid {
+        prev = Some(swap.clone());
         db::delete_space_record_with_swap(&state.db, state.db_backend, &record_uri, &swap).await?;
     } else {
         let record = db::get_space_record(&state.db, state.db_backend, &record_uri).await?;
@@ -217,12 +344,17 @@ pub(crate) async fn delete_record(
                 ));
             }
             None => return Err(AppError::NotFound("Record not found".into())),
-            _ => {}
+            Some(r) => prev = Some(r.cid),
         }
         db::delete_space_record(&state.db, state.db_backend, &record_uri).await?;
     }
-    let rev = generate_tid();
-    db::update_space_revision(&state.db, state.db_backend, &space.id, &rev).await?;
+    commit_ops(
+        state,
+        &space,
+        did,
+        &[PendingOp::delete(collection, rkey, prev)],
+    )
+    .await?;
     Ok(())
 }
 

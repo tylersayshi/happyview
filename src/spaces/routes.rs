@@ -594,6 +594,9 @@ async fn apply_writes(
     }
 
     let mut results = Vec::with_capacity(input.writes.len());
+    // Every write in the batch lands under one revision, ordered by position —
+    // see `service::commit_ops`.
+    let mut ops = Vec::with_capacity(input.writes.len());
 
     for op in input.writes {
         match op {
@@ -620,6 +623,11 @@ async fn apply_writes(
                     indexed_at: now_rfc3339(),
                 };
                 db::insert_space_record(&state.db, state.db_backend, &record).await?;
+                ops.push(service::PendingOp::create(
+                    &record.collection,
+                    &record.rkey,
+                    &cid,
+                ));
                 results.push(serde_json::json!({
                     "uri": record_uri,
                     "cid": cid,
@@ -647,6 +655,11 @@ async fn apply_writes(
                     cid: cid.clone(),
                     indexed_at: now_rfc3339(),
                 };
+                // The outgoing version, for the log's `prev` link.
+                let prev = match &swap_record {
+                    Some(swap_cid) => Some(swap_cid.clone()),
+                    None => service::current_cid(&state, &record_uri).await?,
+                };
                 if let Some(swap_cid) = swap_record {
                     db::upsert_space_record_with_swap(
                         &state.db,
@@ -658,6 +671,12 @@ async fn apply_writes(
                 } else {
                     db::upsert_space_record(&state.db, state.db_backend, &record).await?;
                 }
+                ops.push(service::PendingOp::put(
+                    &record.collection,
+                    &record.rkey,
+                    &cid,
+                    prev,
+                ));
                 results.push(serde_json::json!({
                     "uri": record_uri,
                     "cid": cid,
@@ -672,7 +691,10 @@ async fn apply_writes(
                     "at://{}/space/{}/{}/{}/{}/{}",
                     space.did, space.type_nsid, space.skey, did, collection, rkey
                 );
+                // The version being removed, for the log's `prev` link.
+                let prev;
                 if let Some(swap_cid) = swap_record {
+                    prev = Some(swap_cid.clone());
                     db::delete_space_record_with_swap(
                         &state.db,
                         state.db_backend,
@@ -692,20 +714,30 @@ async fn apply_writes(
                             ));
                         }
                         None => return Err(AppError::NotFound("Record not found".into())),
-                        _ => {}
+                        Some(r) => prev = Some(r.cid),
                     }
                     db::delete_space_record(&state.db, state.db_backend, &record_uri).await?;
                 }
+                ops.push(service::PendingOp::delete(&collection, &rkey, prev));
                 results.push(serde_json::json!({}));
             }
         }
     }
 
-    let rev = generate_tid();
-    db::update_space_revision(&state.db, state.db_backend, &space.id, &rev).await?;
+    // An empty batch changes nothing, so it must not move the head: a revision
+    // backed by no ops would send every client off to fetch a delta that isn't
+    // there. It gets no revision at all, which is the honest answer.
+    let rev = if ops.is_empty() {
+        None
+    } else {
+        Some(service::commit_ops(&state, &space, &did, &ops).await?)
+    };
 
+    let commit = rev.as_ref().map(|r| serde_json::json!({ "rev": r }));
     Ok(Json(serde_json::json!({
         "results": results,
+        "rev": rev,
+        "commit": commit,
     })))
 }
 
@@ -1013,8 +1045,28 @@ async fn get_latest_commit(
         None
     };
 
+    // The head comes from the op log, not from `repo_state.rev` — that column is
+    // the revision *allocator's* high-water mark and can sit one step ahead of
+    // what was actually written (see `service::commit_ops`). A repo with no ops
+    // yet falls back to it so the field keeps its old meaning for callers that
+    // predate the log.
+    let head = oplog::head(&state.db, state.db_backend, &space.id, &params.did).await?;
+    let rev = head
+        .as_ref()
+        .map(|h| h.rev.clone())
+        .or_else(|| repo_state.rev.clone());
+
     Ok(Json(serde_json::json!({
-        "rev": repo_state.rev,
+        "rev": rev,
+        // This instance keeps a per-repo op log, so `listRepoOps` can serve
+        // deltas. A client must not assume that from an empty `ops` array
+        // alone — an instance without the log answers the same way while
+        // holding records it never reported.
+        "oplog": true,
+        // Where this head sits in that log, for a client that wants to start
+        // following along from here. `null` means the log is empty, so there is
+        // nothing to resume from and everything in it (nothing) is already seen.
+        "cursor": head.as_ref().map(|h| h.to_wire()),
         "commit": commit,
     })))
 }
@@ -1111,13 +1163,29 @@ async fn list_repo_ops(
     let limit = params.limit.unwrap_or(100).min(1000);
     let exclude_values = params.exclude_values.unwrap_or(false);
 
+    let cursor = params.cursor.as_deref().and_then(oplog::OpCursor::parse);
+
+    // A cursor from before the retained window can't be answered with a delta:
+    // the ops between it and the oldest op we still hold are gone, and serving
+    // what remains would look complete while quietly skipping them. Say so
+    // instead, and let the caller re-snapshot.
+    if let Some(c) = cursor.as_ref()
+        && !oplog::can_serve(&state.db, state.db_backend, &space.id, &params.did, c).await?
+    {
+        return Ok(Json(serde_json::json!({
+            "ops": [],
+            "cursor": serde_json::Value::Null,
+            "reset": true,
+        })));
+    }
+
     let ops = if exclude_values {
         oplog::list_ops(
             &state.db,
             state.db_backend,
             &space.id,
             &params.did,
-            params.cursor.as_deref(),
+            cursor.as_ref(),
             limit,
         )
         .await?
@@ -1127,13 +1195,25 @@ async fn list_repo_ops(
             state.db_backend,
             &space.id,
             &params.did,
-            params.cursor.as_deref(),
+            cursor.as_ref(),
             limit,
         )
         .await?
     };
 
-    Ok(Json(serde_json::json!({ "ops": ops })))
+    // Resume from the last op handed over. With no ops the caller's own cursor
+    // is still the right place to resume, so echo it rather than dropping them
+    // back to the start of the log.
+    let next = ops
+        .last()
+        .map(|op| oplog::OpCursor::format(&op.rev, op.idx))
+        .or_else(|| cursor.as_ref().map(|c| c.to_wire()));
+
+    Ok(Json(serde_json::json!({
+        "ops": ops,
+        "cursor": next,
+        "reset": false,
+    })))
 }
 
 async fn list_repos(

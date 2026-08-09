@@ -365,12 +365,249 @@ async fn oplog_list_with_since_rev_cursor() {
             .expect("append_op failed");
     }
 
-    let after_rev2 = oplog::list_ops(&pool, backend, &space_id, author_did, Some("rev-0002"), 10)
+    let bare = oplog::OpCursor::parse("rev-0002").expect("cursor parses");
+    let after_rev2 = oplog::list_ops(&pool, backend, &space_id, author_did, Some(&bare), 10)
         .await
         .expect("list_ops with cursor failed");
 
     assert_eq!(after_rev2.len(), 3);
     assert_eq!(after_rev2[0].rev, "rev-0003");
+}
+
+/// A revision can span several ops — every write in an `applyWrites` batch
+/// shares one — so a page ending inside a revision has to resume inside it. A
+/// cursor carrying only the revision would skip the rest of the batch.
+#[tokio::test]
+#[serial]
+async fn oplog_cursor_resumes_inside_a_revision() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    let space_id = new_id();
+    let space = make_space(
+        &space_id,
+        "did:plc:batch-owner",
+        "com.example.batch",
+        "batch-skey",
+    );
+    spaces_db::create_space(&pool, backend, &space)
+        .await
+        .expect("create_space failed");
+
+    let author_did = "did:plc:batch-author";
+
+    // One revision, five ops: an applyWrites batch.
+    for idx in 0..5 {
+        let entry = OplogEntry {
+            id: new_id(),
+            space_id: space_id.clone(),
+            author_did: author_did.to_string(),
+            rev: "rev-0001".to_string(),
+            idx,
+            action: OplogAction::Create,
+            collection: "com.example.item".to_string(),
+            rkey: format!("item-{idx}"),
+            cid: Some(format!("bafy{idx}")),
+            prev: None,
+            value: None,
+            created_at: now_rfc3339(),
+        };
+        oplog::append_op(&pool, backend, &entry)
+            .await
+            .expect("append_op failed");
+    }
+
+    // Page it two at a time, the way a client with a small limit would.
+    let first = oplog::list_ops(&pool, backend, &space_id, author_did, None, 2)
+        .await
+        .expect("first page failed");
+    assert_eq!(first.len(), 2);
+    assert_eq!(first[0].idx, 0);
+    assert_eq!(first[1].idx, 1);
+
+    let cursor = oplog::OpCursor {
+        rev: first[1].rev.clone(),
+        idx: first[1].idx,
+    };
+    let second = oplog::list_ops(&pool, backend, &space_id, author_did, Some(&cursor), 10)
+        .await
+        .expect("second page failed");
+    assert_eq!(
+        second.len(),
+        3,
+        "the rest of the batch must survive the page break"
+    );
+    assert_eq!(second[0].idx, 2);
+
+    let head = oplog::head(&pool, backend, &space_id, author_did)
+        .await
+        .expect("head failed")
+        .expect("a repo with ops has a head");
+    assert_eq!(head.rev, "rev-0001");
+    assert_eq!(head.idx, 4);
+}
+
+/// A cursor is only serveable while everything after it is still retained. An
+/// empty log can vouch for nothing.
+#[tokio::test]
+#[serial]
+async fn oplog_can_serve_rejects_a_cursor_below_the_floor() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    let space_id = new_id();
+    let space = make_space(
+        &space_id,
+        "did:plc:floor-owner",
+        "com.example.floor",
+        "floor-skey",
+    );
+    spaces_db::create_space(&pool, backend, &space)
+        .await
+        .expect("create_space failed");
+
+    let author_did = "did:plc:floor-author";
+    let below = oplog::OpCursor {
+        rev: "rev-0001".to_string(),
+        idx: 0,
+    };
+
+    assert!(
+        !oplog::can_serve(&pool, backend, &space_id, author_did, &below)
+            .await
+            .expect("can_serve failed"),
+        "an empty log cannot serve any cursor"
+    );
+
+    for i in 2..=3 {
+        let entry = OplogEntry {
+            id: new_id(),
+            space_id: space_id.clone(),
+            author_did: author_did.to_string(),
+            rev: format!("rev-{i:04}"),
+            idx: 0,
+            action: OplogAction::Create,
+            collection: "com.example.item".to_string(),
+            rkey: format!("item-{i}"),
+            cid: Some(format!("bafy{i}")),
+            prev: None,
+            value: None,
+            created_at: now_rfc3339(),
+        };
+        oplog::append_op(&pool, backend, &entry)
+            .await
+            .expect("append_op failed");
+    }
+
+    assert!(
+        !oplog::can_serve(&pool, backend, &space_id, author_did, &below)
+            .await
+            .expect("can_serve failed"),
+        "rev-0001 predates the oldest retained op, so the gap is unknowable"
+    );
+
+    let at_floor = oplog::OpCursor {
+        rev: "rev-0002".to_string(),
+        idx: 0,
+    };
+    assert!(
+        oplog::can_serve(&pool, backend, &space_id, author_did, &at_floor)
+            .await
+            .expect("can_serve failed"),
+        "everything after the floor is still retained"
+    );
+}
+
+/// Revisions are handed out one at a time and never go backwards, even when the
+/// clock keeps returning the same microsecond.
+#[tokio::test]
+#[serial]
+async fn allocate_repo_rev_is_strictly_increasing() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    let space_id = new_id();
+    let space = make_space(
+        &space_id,
+        "did:plc:rev-owner",
+        "com.example.rev",
+        "rev-skey",
+    );
+    spaces_db::create_space(&pool, backend, &space)
+        .await
+        .expect("create_space failed");
+
+    let author_did = "did:plc:rev-author";
+    let mut prev = String::new();
+    for _ in 0..25 {
+        let rev = spaces_db::allocate_repo_rev(&pool, backend, &space_id, author_did)
+            .await
+            .expect("allocate_repo_rev failed");
+        assert!(rev > prev, "{rev} should sort after {prev}");
+        prev = rev;
+    }
+}
+
+/// Pruning must never take a repo's newest op: it is the anchor a caught-up
+/// client's cursor points at, and without it every poll would re-snapshot.
+#[tokio::test]
+#[serial]
+async fn prune_keeps_the_newest_op() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    let space_id = new_id();
+    let space = make_space(
+        &space_id,
+        "did:plc:prune-owner",
+        "com.example.prune",
+        "prune-skey",
+    );
+    spaces_db::create_space(&pool, backend, &space)
+        .await
+        .expect("create_space failed");
+
+    let author_did = "did:plc:prune-author";
+    let ancient = (chrono::Utc::now() - chrono::Duration::days(400)).to_rfc3339();
+
+    for i in 1..=3 {
+        let entry = OplogEntry {
+            id: new_id(),
+            space_id: space_id.clone(),
+            author_did: author_did.to_string(),
+            rev: format!("rev-{i:04}"),
+            idx: 0,
+            action: OplogAction::Create,
+            collection: "com.example.item".to_string(),
+            rkey: format!("item-{i}"),
+            cid: Some(format!("bafy{i}")),
+            prev: None,
+            value: None,
+            created_at: ancient.clone(),
+        };
+        oplog::append_op(&pool, backend, &entry)
+            .await
+            .expect("append_op failed");
+    }
+
+    let removed = oplog::prune(&pool, backend, 30)
+        .await
+        .expect("prune failed");
+    assert_eq!(removed, 2, "everything but the newest op should go");
+
+    let left = oplog::list_ops(&pool, backend, &space_id, author_did, None, 10)
+        .await
+        .expect("list_ops failed");
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].rev, "rev-0003");
 }
 
 // ---------------------------------------------------------------------------

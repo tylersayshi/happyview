@@ -23,6 +23,32 @@ pub fn generate_tid() -> String {
     encode_base32_sort(val)
 }
 
+/// Generate a TID guaranteed to sort strictly after `prev`.
+///
+/// `generate_tid` alone does not guarantee this. Its low 10 bits are a *random*
+/// clock ID, so two TIDs minted in the same microsecond order arbitrarily, and a
+/// clock that steps backwards produces one that sorts before its predecessor.
+/// That is harmless for record keys, but a repo revision is read back as a
+/// cursor (`rev > ?`): a revision that sorts below the one before it would make
+/// the ops it labels invisible to every client already past that point.
+///
+/// So: take the clock's answer when it is already ahead, and otherwise fall back
+/// to `prev + 1`, which is the next representable TID.
+pub fn next_tid_after(prev: Option<&str>) -> String {
+    let tid = generate_tid();
+    let Some(prev) = prev else { return tid };
+    if tid.as_str() > prev {
+        return tid;
+    }
+    // A `prev` we can't decode isn't a TID we can increment past. Handing back
+    // the clock's value is the best available answer, and the caller's
+    // compare-and-set still refuses to move a revision backwards.
+    match decode_base32_sort(prev) {
+        Some(val) => encode_base32_sort(val.saturating_add(1)),
+        None => tid,
+    }
+}
+
 /// Encode a u64 into a 13-character base32-sortstring.
 fn encode_base32_sort(mut val: u64) -> String {
     let mut buf = [0u8; 13];
@@ -119,6 +145,40 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let b = generate_tid();
         assert!(b > a, "later TID '{b}' should sort after earlier TID '{a}'");
+    }
+
+    #[test]
+    fn next_tid_after_none_is_a_plain_tid() {
+        let tid = next_tid_after(None);
+        assert_eq!(tid.len(), 13);
+    }
+
+    #[test]
+    fn next_tid_after_advances_past_a_future_prev() {
+        // A `prev` from far in the future is what a clock step backwards looks
+        // like; the result must still sort after it.
+        let future = encode_base32_sort(u64::MAX / 2);
+        let next = next_tid_after(Some(&future));
+        assert!(next > future, "{next} should sort after {future}");
+        assert_eq!(decode_base32_sort(&next), Some(u64::MAX / 2 + 1));
+    }
+
+    #[test]
+    fn next_tid_after_is_strictly_increasing_in_a_tight_loop() {
+        // The case the random clock ID breaks: many revisions minted inside the
+        // same microsecond.
+        let mut prev = next_tid_after(None);
+        for _ in 0..1000 {
+            let next = next_tid_after(Some(&prev));
+            assert!(next > prev, "{next} should sort after {prev}");
+            prev = next;
+        }
+    }
+
+    #[test]
+    fn next_tid_after_tolerates_an_undecodable_prev() {
+        let next = next_tid_after(Some("not-a-tid"));
+        assert_eq!(next.len(), 13);
     }
 
     #[test]

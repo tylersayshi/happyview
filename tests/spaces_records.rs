@@ -1394,3 +1394,439 @@ async fn apply_writes_delete_op_ignores_disallowed_collection() {
         "delete op must not be gated by allowedCollections"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Op log: getLatestCommit / listRepoOps
+// ---------------------------------------------------------------------------
+
+fn list_repo_ops_req(
+    space_uri: &str,
+    did: &str,
+    cursor: Option<&str>,
+    limit: Option<i64>,
+    cookie: Option<(HeaderName, HeaderValue)>,
+) -> Request<Body> {
+    let mut uri = format!(
+        "/xrpc/com.atproto.space.listRepoOps?space={}&did={}",
+        urlencoding::encode(space_uri),
+        urlencoding::encode(did),
+    );
+    if let Some(c) = cursor {
+        uri.push_str(&format!("&cursor={}", urlencoding::encode(c)));
+    }
+    if let Some(l) = limit {
+        uri.push_str(&format!("&limit={l}"));
+    }
+    let mut b = Request::builder().method("GET").uri(uri);
+    if let Some((name, value)) = cookie {
+        b = b.header(name, value);
+    }
+    b.body(Body::empty()).unwrap()
+}
+
+fn latest_commit_req(
+    space_uri: &str,
+    did: &str,
+    cookie: Option<(HeaderName, HeaderValue)>,
+) -> Request<Body> {
+    let mut b = Request::builder().method("GET").uri(format!(
+        "/xrpc/com.atproto.space.getLatestCommit?space={}&did={}",
+        urlencoding::encode(space_uri),
+        urlencoding::encode(did),
+    ));
+    if let Some((name, value)) = cookie {
+        b = b.header(name, value);
+    }
+    b.body(Body::empty()).unwrap()
+}
+
+/// Set up a space with one write member, ready to write into.
+async fn oplog_fixture(app: &TestApp, label: &str) -> (String, String, String) {
+    enable_spaces(app).await;
+    let authority = rand_did(label);
+    let writer = rand_did("writer");
+    let skey = rand_skey("space");
+    let (space_id, space_uri) = create_space(app, &authority, &skey).await;
+    add_member(app, &space_id, &writer, SpaceAccess::Write).await;
+    (space_id, space_uri, writer)
+}
+
+/// Every record write lands in the repo's op log, in order, with the action it
+/// actually performed: a first put creates, a second updates and links back to
+/// the version it replaced, and a delete carries no cid.
+#[tokio::test]
+#[serial]
+async fn writes_are_recorded_in_the_op_log() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let (_space_id, space_uri, writer) = oplog_fixture(&app, "oplog").await;
+
+    let collection = "com.example.item";
+    let first = json!({ "$type": collection, "text": "one" });
+    let second = json!({ "$type": collection, "text": "two" });
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(put_record_req(
+            &space_uri,
+            collection,
+            "rk1",
+            &first,
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let first_cid = json_of(resp).await["cid"].as_str().unwrap().to_string();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(put_record_req(
+            &space_uri,
+            collection,
+            "rk1",
+            &second,
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let second_cid = json_of(resp).await["cid"].as_str().unwrap().to_string();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(delete_record_req(
+            &space_uri,
+            collection,
+            "rk1",
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(list_repo_ops_req(
+            &space_uri,
+            &writer,
+            None,
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_of(resp).await;
+    let ops = body["ops"].as_array().expect("ops present");
+    assert_eq!(ops.len(), 3, "one op per write: {body}");
+
+    assert_eq!(ops[0]["action"], json!("create"));
+    assert_eq!(ops[0]["cid"], json!(first_cid));
+    assert_eq!(ops[0]["prev"], json!(null));
+
+    assert_eq!(ops[1]["action"], json!("update"));
+    assert_eq!(ops[1]["cid"], json!(second_cid));
+    assert_eq!(
+        ops[1]["prev"],
+        json!(first_cid),
+        "an update links back to the version it replaced"
+    );
+
+    assert_eq!(ops[2]["action"], json!("delete"));
+    assert_eq!(ops[2]["cid"], json!(null));
+    assert_eq!(ops[2]["prev"], json!(second_cid));
+
+    // Revisions are per-write and strictly increasing.
+    let revs: Vec<&str> = ops.iter().map(|o| o["rev"].as_str().unwrap()).collect();
+    assert!(revs[0] < revs[1] && revs[1] < revs[2], "revs: {revs:?}");
+
+    assert_eq!(body["reset"], json!(false));
+    assert_eq!(
+        body["cursor"],
+        json!(format!("{}:0", revs[2])),
+        "the cursor names the last op handed over"
+    );
+}
+
+/// Only the op that wrote the record a collection currently holds carries a
+/// value; a superseded update and a delete do not. Consumers collapse to the
+/// last op per record, which always has one.
+#[tokio::test]
+#[serial]
+async fn op_values_follow_the_live_record() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let (_space_id, space_uri, writer) = oplog_fixture(&app, "opvalues").await;
+
+    let collection = "com.example.item";
+    for text in ["one", "two"] {
+        let resp = app
+            .router
+            .clone()
+            .oneshot(put_record_req(
+                &space_uri,
+                collection,
+                "rk1",
+                &json!({ "$type": collection, "text": text }),
+                None,
+                Some(cookie_for(&app, &writer)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(list_repo_ops_req(
+            &space_uri,
+            &writer,
+            None,
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    let body = json_of(resp).await;
+    let ops = body["ops"].as_array().unwrap();
+    assert_eq!(ops.len(), 2);
+    assert!(
+        ops[0].get("value").is_none(),
+        "the superseded write carries no value: {}",
+        ops[0]
+    );
+    assert_eq!(ops[1]["value"]["text"], json!("two"));
+}
+
+/// An applyWrites batch is one revision: its ops share a rev and are ordered by
+/// idx, so a client paging with a small limit resumes inside the batch instead
+/// of skipping the rest of it.
+#[tokio::test]
+#[serial]
+async fn apply_writes_is_one_revision_and_pages_by_idx() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let (_space_id, space_uri, writer) = oplog_fixture(&app, "batch").await;
+
+    let collection = "com.example.item";
+    let writes = json!([
+        write_op_create(
+            collection,
+            Some("a"),
+            &json!({ "$type": collection, "n": 1 })
+        ),
+        write_op_create(
+            collection,
+            Some("b"),
+            &json!({ "$type": collection, "n": 2 })
+        ),
+        write_op_create(
+            collection,
+            Some("c"),
+            &json!({ "$type": collection, "n": 3 })
+        ),
+    ]);
+    let resp = app
+        .router
+        .clone()
+        .oneshot(apply_writes_req(
+            &space_uri,
+            writes,
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let batch_rev = json_of(resp).await["rev"]
+        .as_str()
+        .expect("applyWrites reports the revision it wrote")
+        .to_string();
+
+    // First page stops in the middle of the batch.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(list_repo_ops_req(
+            &space_uri,
+            &writer,
+            None,
+            Some(2),
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    let body = json_of(resp).await;
+    let ops = body["ops"].as_array().unwrap();
+    assert_eq!(ops.len(), 2);
+    assert_eq!(ops[0]["rev"], json!(batch_rev));
+    assert_eq!(ops[1]["rev"], json!(batch_rev), "one rev for the batch");
+    assert_eq!(ops[0]["idx"], json!(0));
+    assert_eq!(ops[1]["idx"], json!(1));
+    let cursor = body["cursor"].as_str().unwrap().to_string();
+    assert_eq!(cursor, format!("{batch_rev}:1"));
+
+    // Resuming from it must return the remaining op, not skip to the next rev.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(list_repo_ops_req(
+            &space_uri,
+            &writer,
+            Some(&cursor),
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    let body = json_of(resp).await;
+    let ops = body["ops"].as_array().unwrap();
+    assert_eq!(ops.len(), 1, "the tail of the batch must not be skipped");
+    assert_eq!(ops[0]["idx"], json!(2));
+    assert_eq!(ops[0]["rkey"], json!("c"));
+}
+
+/// A caught-up cursor returns nothing and stays where it is — that is the
+/// steady state, and it must not read as "reset" or rewind to the log's start.
+#[tokio::test]
+#[serial]
+async fn a_caught_up_cursor_returns_no_ops_and_holds_its_place() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let (_space_id, space_uri, writer) = oplog_fixture(&app, "caughtup").await;
+
+    let collection = "com.example.item";
+    let resp = app
+        .router
+        .clone()
+        .oneshot(put_record_req(
+            &space_uri,
+            collection,
+            "rk1",
+            &json!({ "$type": collection, "text": "one" }),
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(latest_commit_req(
+            &space_uri,
+            &writer,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let head = json_of(resp).await;
+    assert_eq!(
+        head["oplog"],
+        json!(true),
+        "the delta capability has to be advertised, not inferred"
+    );
+    let cursor = head["cursor"]
+        .as_str()
+        .expect("head names a cursor")
+        .to_string();
+    let rev = head["rev"].as_str().expect("head names a rev").to_string();
+    assert_eq!(cursor, format!("{rev}:0"));
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(list_repo_ops_req(
+            &space_uri,
+            &writer,
+            Some(&cursor),
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    let body = json_of(resp).await;
+    assert_eq!(body["ops"].as_array().unwrap().len(), 0);
+    assert_eq!(body["reset"], json!(false));
+    assert_eq!(body["cursor"], json!(cursor), "the caller keeps its place");
+}
+
+/// A cursor from before the retained window can't be answered with a delta, so
+/// the server says so rather than serving a partial answer that looks whole.
+#[tokio::test]
+#[serial]
+async fn a_cursor_below_the_retained_window_asks_for_a_reset() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let (_space_id, space_uri, writer) = oplog_fixture(&app, "reset").await;
+
+    let collection = "com.example.item";
+    let resp = app
+        .router
+        .clone()
+        .oneshot(put_record_req(
+            &space_uri,
+            collection,
+            "rk1",
+            &json!({ "$type": collection, "text": "one" }),
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // "2222222222222" is TID zero: older than any revision we could have minted.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(list_repo_ops_req(
+            &space_uri,
+            &writer,
+            Some("2222222222222:0"),
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    let body = json_of(resp).await;
+    assert_eq!(body["reset"], json!(true));
+    assert_eq!(body["ops"].as_array().unwrap().len(), 0);
+}
+
+/// A repo nobody has written to has no head, and therefore nothing to resume
+/// from — but the instance still advertises that it keeps a log.
+#[tokio::test]
+#[serial]
+async fn an_untouched_repo_has_no_head_but_still_advertises_the_log() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let (_space_id, space_uri, writer) = oplog_fixture(&app, "empty").await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(latest_commit_req(
+            &space_uri,
+            &writer,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_of(resp).await;
+    assert_eq!(body["oplog"], json!(true));
+    assert_eq!(body["rev"], json!(null));
+    assert_eq!(body["cursor"], json!(null));
+}

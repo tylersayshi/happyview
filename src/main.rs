@@ -663,6 +663,12 @@ async fn main() {
         state.db_backend,
     ));
 
+    tokio::spawn(happyview::spaces::oplog::spawn_retention_cleanup(
+        state.db.clone(),
+        happyview::spaces::oplog::RETENTION_DAYS,
+        state.db_backend,
+    ));
+
     {
         let db = state.db.clone();
         let flag = state.verbose_event_logging.clone();

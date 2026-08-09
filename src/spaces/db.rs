@@ -788,6 +788,67 @@ pub async fn get_or_create_repo_state(
     })
 }
 
+/// Reserve the next revision for one repo (a `(space, author)` pair) and return
+/// it.
+///
+/// `happyview_space_repo_state.rev` is the allocator's high-water mark, not the
+/// repo's published head — the head is whatever the oplog actually contains (see
+/// `oplog::head`), so a crash between reserving a revision and appending its ops
+/// leaves a hole in the sequence rather than a head that points at ops nobody
+/// wrote.
+///
+/// Allocation is a compare-and-set rather than a read-then-write: two writers
+/// racing on the same repo must not be handed the same revision, or the loser's
+/// ops would hide behind the winner's cursor. The `rev < ?` predicate means
+/// exactly one of them lands, and the other retries against the value that won.
+pub async fn allocate_repo_rev(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+    author_did: &str,
+) -> Result<String, AppError> {
+    let sql = adapt_sql(
+        "UPDATE happyview_space_repo_state SET rev = ?, updated_at = ? WHERE id = ? AND (rev IS NULL OR rev < ?)",
+        backend,
+    );
+
+    // Bounded: each attempt either wins or observes a strictly larger `rev`, so
+    // the loop only spins while writers are genuinely contending. Ten rounds is
+    // far past anything a personal space produces.
+    let mut last_err = None;
+    for _ in 0..10 {
+        let state = match get_or_create_repo_state(pool, backend, space_id, author_did).await {
+            Ok(state) => state,
+            // The row is UNIQUE on (space, author), so the very first two
+            // concurrent writes to a repo race to create it and one of them
+            // loses. That is not a failure — the next pass reads the winner's
+            // row. A fault that isn't a lost race just fails every pass and is
+            // reported once the attempts run out.
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let next = crate::lua::tid::next_tid_after(state.rev.as_deref());
+        let now = now_rfc3339();
+        let result = crate::db::query(&sql)
+            .bind(&next)
+            .bind(&now)
+            .bind(&state.id)
+            .bind(&next)
+            .execute(pool)
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to allocate repo revision: {e}")))?;
+        if result.rows_affected() > 0 {
+            return Ok(next);
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        AppError::Internal("failed to allocate repo revision: too much contention".into())
+    }))
+}
+
 pub async fn update_repo_state(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
