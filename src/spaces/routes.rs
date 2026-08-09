@@ -1047,14 +1047,21 @@ async fn get_latest_commit(
 
     // The head comes from the op log, not from `repo_state.rev` — that column is
     // the revision *allocator's* high-water mark and can sit one step ahead of
-    // what was actually written (see `service::commit_ops`). A repo with no ops
-    // yet falls back to it so the field keeps its old meaning for callers that
-    // predate the log.
+    // what was actually written (see `service::commit_ops`).
+    //
+    // The two fallbacks are for repos written before the log existed. Their
+    // records are real but produced no ops, and reporting no revision at all
+    // would tell a client "nothing here" about a space full of data — or, worse,
+    // leave it with no way to notice a change and no choice but to re-read
+    // everything on every poll. The space revision has been maintained on every
+    // write all along, so it answers that until the repo's next write puts a
+    // real head in the log.
     let head = oplog::head(&state.db, state.db_backend, &space.id, &params.did).await?;
     let rev = head
         .as_ref()
         .map(|h| h.rev.clone())
-        .or_else(|| repo_state.rev.clone());
+        .or_else(|| repo_state.rev.clone())
+        .or_else(|| space.revision.clone());
 
     Ok(Json(serde_json::json!({
         "rev": rev,

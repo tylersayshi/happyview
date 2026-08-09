@@ -1830,3 +1830,65 @@ async fn an_untouched_repo_has_no_head_but_still_advertises_the_log() {
     assert_eq!(body["rev"], json!(null));
     assert_eq!(body["cursor"], json!(null));
 }
+
+/// Spaces written before the op log existed hold records that produced no ops.
+/// They still need a head a client can poll, or every cycle would have to
+/// re-read the whole store — so the space revision, which has been maintained
+/// on every write all along, stands in until the repo's next write.
+#[tokio::test]
+#[serial]
+async fn a_repo_that_predates_the_log_falls_back_to_the_space_revision() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let (space_id, space_uri, writer) = oplog_fixture(&app, "legacy").await;
+
+    // A record seeded straight into the table, as a pre-oplog write left it.
+    let collection = "com.example.item";
+    spaces_db::insert_space_record(
+        &app.state.db,
+        app.state.db_backend,
+        &SpaceRecord {
+            uri: format!("{space_uri}/{writer}/{collection}/legacy1"),
+            space_id: space_id.clone(),
+            author_did: writer.clone(),
+            collection: collection.to_string(),
+            rkey: "legacy1".to_string(),
+            record: json!({ "$type": collection, "text": "from before" }),
+            cid: "bafyreilegacy00000000000000000000000000".to_string(),
+            indexed_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("seed record failed");
+    spaces_db::update_space_revision(
+        &app.state.db,
+        app.state.db_backend,
+        &space_id,
+        "3legacyrev00",
+    )
+    .await
+    .expect("seed revision failed");
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(latest_commit_req(
+            &space_uri,
+            &writer,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_of(resp).await;
+    assert_eq!(
+        body["rev"],
+        json!("3legacyrev00"),
+        "a repo with records but no ops still reports a pollable head"
+    );
+    assert_eq!(
+        body["cursor"],
+        json!(null),
+        "with no ops there is nothing to resume from, so the client snapshots"
+    );
+}
