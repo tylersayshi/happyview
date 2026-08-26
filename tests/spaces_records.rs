@@ -1892,3 +1892,233 @@ async fn a_repo_that_predates_the_log_falls_back_to_the_space_revision() {
         "with no ops there is nothing to resume from, so the client snapshots"
     );
 }
+
+/// A batch carrying one stale `swapRecord` is refused before any of it lands:
+/// nothing changes in the records table and nothing reaches the op log.
+///
+/// This used to apply write-by-write and abandon the batch at the first
+/// refusal — with everything before that point already applied but, because
+/// `commit_ops` never ran, absent from the op log and invisible to every
+/// delta-following client (the head they poll only moves when ops commit).
+#[tokio::test]
+#[serial]
+async fn a_stale_swap_rejects_the_whole_batch_and_logs_nothing() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let (_space_id, space_uri, writer) = oplog_fixture(&app, "atomicbatch").await;
+
+    let collection = "com.example.item";
+    let a_v1 = json!({ "$type": collection, "text": "a v1" });
+    for (rkey, value) in [("rka", &a_v1), ("rkb", &json!({ "$type": collection, "text": "b v1" }))] {
+        let resp = app
+            .router
+            .clone()
+            .oneshot(put_record_req(
+                &space_uri,
+                collection,
+                rkey,
+                value,
+                None,
+                Some(cookie_for(&app, &writer)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // A's current version, so the batch's first write names a *correct* swap.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(get_record_req(
+            &space_uri,
+            collection,
+            "rka",
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    let a_cid = json_of(resp).await["cid"].as_str().unwrap().to_string();
+
+    // Where the log stands before the batch.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(latest_commit_req(
+            &space_uri,
+            &writer,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    let cursor = json_of(resp).await["cursor"]
+        .as_str()
+        .expect("head names a cursor")
+        .to_string();
+
+    // First write is fine, second names a version B never held.
+    let writes = json!([
+        write_op_update(collection, "rka", &json!({ "$type": collection, "text": "a v2" }), Some(&a_cid)),
+        write_op_update(collection, "rkb", &json!({ "$type": collection, "text": "b v2" }), Some("bafyreib-stale")),
+    ]);
+    let resp = app
+        .router
+        .clone()
+        .oneshot(apply_writes_req(
+            &space_uri,
+            writes,
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // The valid first write must NOT have landed: the refusal is atomic.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(get_record_req(
+            &space_uri,
+            collection,
+            "rka",
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    let a_after = json_of(resp).await;
+    assert_eq!(a_after["value"], a_v1, "a refused batch must apply nothing");
+    assert_eq!(a_after["cid"], json!(a_cid));
+
+    // And the log did not move.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(list_repo_ops_req(
+            &space_uri,
+            &writer,
+            Some(&cursor),
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    let body = json_of(resp).await;
+    assert_eq!(body["ops"].as_array().unwrap().len(), 0);
+    assert_eq!(body["reset"], json!(false));
+}
+
+/// The precheck reads pre-batch state, so a batch whose writes invalidate each
+/// other (same rkey twice, both naming the original version — the shape a race
+/// between two writers produces) still fails mid-apply. The writes that landed
+/// before the refusal MUST reach the op log anyway: a records-table change the
+/// log never records is invisible to every delta-following client forever.
+#[tokio::test]
+#[serial]
+async fn a_mid_batch_refusal_still_logs_the_writes_that_landed() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let (_space_id, space_uri, writer) = oplog_fixture(&app, "midbatch").await;
+
+    let collection = "com.example.item";
+    let resp = app
+        .router
+        .clone()
+        .oneshot(put_record_req(
+            &space_uri,
+            collection,
+            "rka",
+            &json!({ "$type": collection, "text": "a v1" }),
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(get_record_req(
+            &space_uri,
+            collection,
+            "rka",
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    let a_cid = json_of(resp).await["cid"].as_str().unwrap().to_string();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(latest_commit_req(
+            &space_uri,
+            &writer,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    let cursor = json_of(resp).await["cursor"]
+        .as_str()
+        .expect("head names a cursor")
+        .to_string();
+
+    // Both writes name the version rka holds *now*, so the precheck passes
+    // both; the first write then moves the record and the second refuses.
+    let a_v2 = json!({ "$type": collection, "text": "a v2" });
+    let writes = json!([
+        write_op_update(collection, "rka", &a_v2, Some(&a_cid)),
+        write_op_update(collection, "rka", &json!({ "$type": collection, "text": "a v3" }), Some(&a_cid)),
+    ]);
+    let resp = app
+        .router
+        .clone()
+        .oneshot(apply_writes_req(
+            &space_uri,
+            writes,
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // The first write applied…
+    let resp = app
+        .router
+        .clone()
+        .oneshot(get_record_req(
+            &space_uri,
+            collection,
+            "rka",
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    let a_after = json_of(resp).await;
+    assert_eq!(a_after["value"], a_v2);
+
+    // …and, the point of the fix: its op is in the log despite the refusal.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(list_repo_ops_req(
+            &space_uri,
+            &writer,
+            Some(&cursor),
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    let body = json_of(resp).await;
+    let ops = body["ops"].as_array().expect("ops array");
+    assert_eq!(ops.len(), 1, "the landed write must be logged");
+    assert_eq!(ops[0]["action"], json!("update"));
+    assert_eq!(ops[0]["rkey"], json!("rka"));
+    assert_eq!(
+        ops[0]["value"], a_v2,
+        "the op carries the body the record now holds"
+    );
+}

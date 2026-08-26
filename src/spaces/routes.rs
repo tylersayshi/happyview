@@ -565,6 +565,189 @@ async fn delete_record(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
+/// The URI a space record lives at. One author's records are namespaced under
+/// their DID, so a caller can only ever address its own keys.
+fn space_record_uri(space: &Space, did: &str, collection: &str, rkey: &str) -> String {
+    format!(
+        "at://{}/space/{}/{}/{}/{}/{}",
+        space.did, space.type_nsid, space.skey, did, collection, rkey
+    )
+}
+
+/// Reject an `applyWrites` batch before any of it lands, for every failure
+/// visible at request time: a swap naming a version the record no longer holds,
+/// a delete of a record that isn't there or isn't the caller's, a collection
+/// the space doesn't allow.
+///
+/// This is what makes the routine conflict atomic, as the protocol promises. A
+/// batch used to be applied write-by-write and abandoned at the first refusal —
+/// with everything before that point already in the records table and, because
+/// `commit_ops` never ran, absent from the op log forever. Delta-following
+/// clients poll a head that only moves when ops commit, so those writes
+/// (deletes included) were simply invisible to every other device.
+///
+/// The checks read pre-batch state, so a batch touching one rkey twice may be
+/// misjudged here — the apply loop's own guards still hold in that case, and a
+/// refusal there takes the commit-what-landed path in `apply_writes`.
+async fn check_apply_writes_preconditions(
+    state: &AppState,
+    space: &Space,
+    did: &str,
+    writes: &[WriteOp],
+) -> Result<(), AppError> {
+    for op in writes {
+        match op {
+            WriteOp::Create { collection, .. } => {
+                service::check_collection_allowed(space, collection)?;
+            }
+            WriteOp::Update {
+                collection,
+                rkey,
+                swap_record,
+                ..
+            } => {
+                service::check_collection_allowed(space, collection)?;
+                if let Some(swap) = swap_record {
+                    let uri = space_record_uri(space, did, collection, rkey);
+                    match db::get_space_record(&state.db, state.db_backend, &uri).await? {
+                        None => return Err(AppError::NotFound("Record not found".into())),
+                        Some(r) if r.cid != *swap => {
+                            return Err(AppError::Conflict("Record CID mismatch".into()));
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+            WriteOp::Delete {
+                collection,
+                rkey,
+                swap_record,
+            } => {
+                let uri = space_record_uri(space, did, collection, rkey);
+                let existing = db::get_space_record(&state.db, state.db_backend, &uri).await?;
+                match (existing, swap_record) {
+                    (None, _) => return Err(AppError::NotFound("Record not found".into())),
+                    (Some(r), Some(swap)) if r.cid != *swap => {
+                        return Err(AppError::Conflict("Record CID mismatch".into()));
+                    }
+                    (Some(r), None) if r.author_did != did => {
+                        return Err(AppError::Forbidden(
+                            "You can only delete your own records".into(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply one write from an `applyWrites` batch, returning the result entry and
+/// the op to log for it. Split out of the loop so the caller can catch a
+/// mid-batch refusal and still commit the ops that landed before it.
+async fn apply_one_write(
+    state: &AppState,
+    space: &Space,
+    did: &str,
+    op: WriteOp,
+) -> Result<(serde_json::Value, service::PendingOp), AppError> {
+    match op {
+        WriteOp::Create {
+            collection,
+            rkey,
+            value,
+        } => {
+            service::check_collection_allowed(space, &collection)?;
+            let rkey = rkey.unwrap_or_else(generate_tid);
+            let cid = service::content_cid(&value);
+            let record_uri = space_record_uri(space, did, &collection, &rkey);
+            let record = SpaceRecord {
+                uri: record_uri.clone(),
+                space_id: space.id.clone(),
+                author_did: did.to_string(),
+                collection,
+                rkey,
+                record: value,
+                cid: cid.clone(),
+                indexed_at: now_rfc3339(),
+            };
+            db::insert_space_record(&state.db, state.db_backend, &record).await?;
+            Ok((
+                serde_json::json!({ "uri": record_uri, "cid": cid }),
+                service::PendingOp::create(&record.collection, &record.rkey, &cid),
+            ))
+        }
+        WriteOp::Update {
+            collection,
+            rkey,
+            value,
+            swap_record,
+        } => {
+            service::check_collection_allowed(space, &collection)?;
+            let cid = service::content_cid(&value);
+            let record_uri = space_record_uri(space, did, &collection, &rkey);
+            let record = SpaceRecord {
+                uri: record_uri.clone(),
+                space_id: space.id.clone(),
+                author_did: did.to_string(),
+                collection,
+                rkey,
+                record: value,
+                cid: cid.clone(),
+                indexed_at: now_rfc3339(),
+            };
+            // The outgoing version, for the log's `prev` link.
+            let prev = match &swap_record {
+                Some(swap_cid) => Some(swap_cid.clone()),
+                None => service::current_cid(state, &record_uri).await?,
+            };
+            if let Some(swap_cid) = swap_record {
+                db::upsert_space_record_with_swap(&state.db, state.db_backend, &record, &swap_cid)
+                    .await?;
+            } else {
+                db::upsert_space_record(&state.db, state.db_backend, &record).await?;
+            }
+            Ok((
+                serde_json::json!({ "uri": record_uri, "cid": cid }),
+                service::PendingOp::put(&record.collection, &record.rkey, &cid, prev),
+            ))
+        }
+        WriteOp::Delete {
+            collection,
+            rkey,
+            swap_record,
+        } => {
+            let record_uri = space_record_uri(space, did, &collection, &rkey);
+            // The version being removed, for the log's `prev` link.
+            let prev;
+            if let Some(swap_cid) = swap_record {
+                prev = Some(swap_cid.clone());
+                db::delete_space_record_with_swap(&state.db, state.db_backend, &record_uri, &swap_cid)
+                    .await?;
+            } else {
+                // Mirrors `service::delete_record`'s non-swap ownership
+                // check: only the record's own author may delete it.
+                let existing = db::get_space_record(&state.db, state.db_backend, &record_uri).await?;
+                match existing {
+                    Some(r) if r.author_did != did => {
+                        return Err(AppError::Forbidden(
+                            "You can only delete your own records".into(),
+                        ));
+                    }
+                    None => return Err(AppError::NotFound("Record not found".into())),
+                    Some(r) => prev = Some(r.cid),
+                }
+                db::delete_space_record(&state.db, state.db_backend, &record_uri).await?;
+            }
+            Ok((
+                serde_json::json!({}),
+                service::PendingOp::delete(&collection, &rkey, prev),
+            ))
+        }
+    }
+}
+
 async fn apply_writes(
     State(state): State<AppState>,
     xrpc_claims: XrpcClaims,
@@ -593,133 +776,31 @@ async fn apply_writes(
         }
     }
 
+    // Refuse the whole batch up front for any failure visible now, so the
+    // ordinary conflict (a stale swapRecord) rejects atomically — nothing
+    // applied, nothing to log.
+    check_apply_writes_preconditions(&state, &space, &did, &input.writes).await?;
+
     let mut results = Vec::with_capacity(input.writes.len());
     // Every write in the batch lands under one revision, ordered by position —
     // see `service::commit_ops`.
     let mut ops = Vec::with_capacity(input.writes.len());
 
+    // A batch racing another writer can still fail mid-loop despite the
+    // precheck. The writes before the failure are already in the records table,
+    // so their ops MUST reach the log before the error goes out: the head other
+    // devices poll only moves when ops commit, and a table change the log never
+    // records is invisible to every delta-following client forever.
+    let mut failure: Option<AppError> = None;
     for op in input.writes {
-        match op {
-            WriteOp::Create {
-                collection,
-                rkey,
-                value,
-            } => {
-                service::check_collection_allowed(&space, &collection)?;
-                let rkey = rkey.unwrap_or_else(generate_tid);
-                let cid = service::content_cid(&value);
-                let record_uri = format!(
-                    "at://{}/space/{}/{}/{}/{}/{}",
-                    space.did, space.type_nsid, space.skey, did, collection, rkey
-                );
-                let record = SpaceRecord {
-                    uri: record_uri.clone(),
-                    space_id: space.id.clone(),
-                    author_did: did.clone(),
-                    collection,
-                    rkey,
-                    record: value,
-                    cid: cid.clone(),
-                    indexed_at: now_rfc3339(),
-                };
-                db::insert_space_record(&state.db, state.db_backend, &record).await?;
-                ops.push(service::PendingOp::create(
-                    &record.collection,
-                    &record.rkey,
-                    &cid,
-                ));
-                results.push(serde_json::json!({
-                    "uri": record_uri,
-                    "cid": cid,
-                }));
+        match apply_one_write(&state, &space, &did, op).await {
+            Ok((result, pending)) => {
+                results.push(result);
+                ops.push(pending);
             }
-            WriteOp::Update {
-                collection,
-                rkey,
-                value,
-                swap_record,
-            } => {
-                service::check_collection_allowed(&space, &collection)?;
-                let cid = service::content_cid(&value);
-                let record_uri = format!(
-                    "at://{}/space/{}/{}/{}/{}/{}",
-                    space.did, space.type_nsid, space.skey, did, collection, rkey
-                );
-                let record = SpaceRecord {
-                    uri: record_uri.clone(),
-                    space_id: space.id.clone(),
-                    author_did: did.clone(),
-                    collection,
-                    rkey,
-                    record: value,
-                    cid: cid.clone(),
-                    indexed_at: now_rfc3339(),
-                };
-                // The outgoing version, for the log's `prev` link.
-                let prev = match &swap_record {
-                    Some(swap_cid) => Some(swap_cid.clone()),
-                    None => service::current_cid(&state, &record_uri).await?,
-                };
-                if let Some(swap_cid) = swap_record {
-                    db::upsert_space_record_with_swap(
-                        &state.db,
-                        state.db_backend,
-                        &record,
-                        &swap_cid,
-                    )
-                    .await?;
-                } else {
-                    db::upsert_space_record(&state.db, state.db_backend, &record).await?;
-                }
-                ops.push(service::PendingOp::put(
-                    &record.collection,
-                    &record.rkey,
-                    &cid,
-                    prev,
-                ));
-                results.push(serde_json::json!({
-                    "uri": record_uri,
-                    "cid": cid,
-                }));
-            }
-            WriteOp::Delete {
-                collection,
-                rkey,
-                swap_record,
-            } => {
-                let record_uri = format!(
-                    "at://{}/space/{}/{}/{}/{}/{}",
-                    space.did, space.type_nsid, space.skey, did, collection, rkey
-                );
-                // The version being removed, for the log's `prev` link.
-                let prev;
-                if let Some(swap_cid) = swap_record {
-                    prev = Some(swap_cid.clone());
-                    db::delete_space_record_with_swap(
-                        &state.db,
-                        state.db_backend,
-                        &record_uri,
-                        &swap_cid,
-                    )
-                    .await?;
-                } else {
-                    // Mirrors `service::delete_record`'s non-swap ownership
-                    // check: only the record's own author may delete it.
-                    let existing =
-                        db::get_space_record(&state.db, state.db_backend, &record_uri).await?;
-                    match existing {
-                        Some(r) if r.author_did != did => {
-                            return Err(AppError::Forbidden(
-                                "You can only delete your own records".into(),
-                            ));
-                        }
-                        None => return Err(AppError::NotFound("Record not found".into())),
-                        Some(r) => prev = Some(r.cid),
-                    }
-                    db::delete_space_record(&state.db, state.db_backend, &record_uri).await?;
-                }
-                ops.push(service::PendingOp::delete(&collection, &rkey, prev));
-                results.push(serde_json::json!({}));
+            Err(err) => {
+                failure = Some(err);
+                break;
             }
         }
     }
@@ -732,6 +813,12 @@ async fn apply_writes(
     } else {
         Some(service::commit_ops(&state, &space, &did, &ops).await?)
     };
+
+    if let Some(err) = failure {
+        // The caller sees the refusal and retries record-by-record; the writes
+        // that landed are committed above, so every device can see them.
+        return Err(err);
+    }
 
     let commit = rev.as_ref().map(|r| serde_json::json!({ "rev": r }));
     Ok(Json(serde_json::json!({
